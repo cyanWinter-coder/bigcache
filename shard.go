@@ -59,6 +59,7 @@ func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, re
 }
 
 func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
+	currentTime := uint64(s.clock.Epoch())
 	s.lock.RLock()
 	wrappedEntry, err := s.getWrappedEntry(hashedKey)
 	if err != nil {
@@ -71,6 +72,13 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 		if s.isVerbose {
 			s.logger.Printf("Collision detected. Both %q and %q have the same hash %x", key, entryKey, hashedKey)
 		}
+		return nil, ErrEntryNotFound
+	}
+	if s.isExpired(wrappedEntry, currentTime) {
+		// The entry is past its life window but has not been cleaned up yet.
+		// It must not be served to readers.
+		s.lock.RUnlock()
+		s.miss()
 		return nil, ErrEntryNotFound
 	}
 	entry := readEntry(wrappedEntry)
@@ -176,6 +184,8 @@ func (s *cacheShard) setWrappedEntryWithoutLock(currentTimestamp uint64, w []byt
 	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
 		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
 			resetHashFromEntry(previousEntry)
+			//remove hashkey
+			delete(s.hashmap, hashedKey)
 		}
 	}
 
@@ -260,11 +270,13 @@ func (s *cacheShard) del(hashedKey uint64) error {
 		}
 
 		delete(s.hashmap, hashedKey)
+		// Invalidate the entry before invoking the callback so it cannot be
+		// reported again when it is eventually popped from the queue.
+		resetHashFromEntry(wrappedEntry)
 		s.onRemove(wrappedEntry, Deleted)
 		if s.statsEnabled {
 			delete(s.hashmapStats, hashedKey)
 		}
-		resetHashFromEntry(wrappedEntry)
 	}
 	s.lock.Unlock()
 
@@ -288,6 +300,10 @@ func (s *cacheShard) isExpired(oldestEntry []byte, currentTimestamp uint64) bool
 	return currentTimestamp-oldestTimestamp >= s.lifeWindow
 }
 
+// cleanUp removes the entries that were already expired when the clean-up
+// round started. currentTimestamp is captured once by the caller for the
+// whole round, so entries expiring while a round is in progress are left
+// for the next one.
 func (s *cacheShard) cleanUp(currentTimestamp uint64) {
 	s.lock.Lock()
 	for {
@@ -300,30 +316,31 @@ func (s *cacheShard) cleanUp(currentTimestamp uint64) {
 	s.lock.Unlock()
 }
 
-func (s *cacheShard) getEntry(hashedKey uint64) ([]byte, error) {
+// copyEntries returns a snapshot of the wrapped entries currently referenced
+// by the shard hashmap. Entries are copied while holding the read lock, so a
+// concurrent clean-up or eviction cannot make the iterator skip entries or
+// observe the same entry twice.
+func (s *cacheShard) copyEntries() (entries [][]byte, count int) {
 	s.lock.RLock()
+	entries = make([][]byte, 0, len(s.hashmap))
 
-	entry, err := s.getWrappedEntry(hashedKey)
-	// copy entry
-	newEntry := make([]byte, len(entry))
-	copy(newEntry, entry)
-
-	s.lock.RUnlock()
-
-	return newEntry, err
-}
-
-func (s *cacheShard) copyHashedKeys() (keys []uint64, next int) {
-	s.lock.RLock()
-	keys = make([]uint64, len(s.hashmap))
-
-	for key := range s.hashmap {
-		keys[next] = key
-		next++
+	for hashedKey, itemIndex := range s.hashmap {
+		wrappedEntry, err := s.entries.Get(int(itemIndex))
+		if err != nil {
+			continue
+		}
+		if readHashFromEntry(wrappedEntry) != hashedKey {
+			// Stale slot: the entry was deleted or overwritten and is
+			// waiting to be popped from the queue.
+			continue
+		}
+		copied := make([]byte, len(wrappedEntry))
+		copy(copied, wrappedEntry)
+		entries = append(entries, copied)
 	}
 
 	s.lock.RUnlock()
-	return keys, next
+	return entries, len(entries)
 }
 
 func (s *cacheShard) removeOldestEntry(reason RemoveReason) error {

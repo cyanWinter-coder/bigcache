@@ -23,6 +23,9 @@ type BigCache struct {
 	shardMask  uint64
 	close      chan struct{}
 	closeOnce  sync.Once
+	// cleanerDone is closed when the cleaning goroutine exits. It is nil
+	// when no cleaning goroutine was started (CleanWindow <= 0).
+	cleanerDone chan struct{}
 }
 
 // Response will contain metadata about the entry for which GetWithInfo(key) was called
@@ -107,17 +110,26 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	}
 
 	if config.CleanWindow > 0 {
+		cache.cleanerDone = make(chan struct{})
 		go func() {
+			defer close(cache.cleanerDone)
 			ticker := time.NewTicker(config.CleanWindow)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case t := <-ticker.C:
-					cache.cleanUp(uint64(t.Unix()))
 				case <-cache.close:
 					return
+				case t := <-ticker.C:
+					// The tick may have been selected while Close was
+					// shutting the cache down; do not run a late clean-up.
+					select {
+					case <-cache.close:
+						return
+					default:
+					}
+					cache.cleanUp(uint64(t.Unix()))
 				}
 			}
 		}()
@@ -129,10 +141,15 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 // Close is used to signal a shutdown of the cache when you are done with it.
 // This allows the cleaning goroutines to exit and ensures references are not
 // kept to the cache preventing GC of the entire cache.
+// Close blocks until the cleaning goroutine has exited, so no late clean-up
+// can write to the shards or trigger remove callbacks after Close returns.
 // Close is idempotent and safe to call concurrently.
 func (c *BigCache) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.close)
+		if c.cleanerDone != nil {
+			<-c.cleanerDone
+		}
 	})
 	return nil
 }
@@ -252,6 +269,13 @@ func (c *BigCache) onEvict(oldestEntry []byte, currentTimestamp uint64, evict fu
 
 func (c *BigCache) cleanUp(currentTimestamp uint64) {
 	for _, shard := range c.shards {
+		select {
+		case <-c.close:
+			// The cache is closing: abort the round instead of removing
+			// entries and firing callbacks after Close.
+			return
+		default:
+		}
 		shard.cleanUp(currentTimestamp)
 	}
 }

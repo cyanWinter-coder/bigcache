@@ -260,3 +260,36 @@ func TestParallelSetAndIteration(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestEntriesIteratorWithConcurrentCleanUp(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	cache, _ := newBigCache(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Second,
+		MaxEntriesInWindow: 100,
+		MaxEntrySize:       256,
+	}, &clock)
+	defer cache.Close()
+
+	keysCount := 100
+	for i := 0; i < keysCount; i++ {
+		cache.Set(fmt.Sprintf("key%d", i), []byte("value"))
+	}
+
+	// when the iteration starts before a clean-up removes every entry
+	iterator := cache.Iterator()
+	clock.set(10)
+	cache.cleanUp(uint64(clock.Epoch()))
+
+	// then the iterator still sees a consistent snapshot: every key exactly once
+	keys := make(map[string]struct{})
+	for iterator.SetNext() {
+		current, err := iterator.Value()
+		noError(t, err)
+		keys[current.Key()] = struct{}{}
+	}
+	assertEqual(t, keysCount, len(keys))
+}

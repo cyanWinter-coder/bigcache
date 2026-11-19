@@ -279,7 +279,7 @@ func TestTimingEvictionShouldEvictOnlyFromUpdatedShard(t *testing.T) {
 	clock := mockedClock{value: 0}
 	cache, _ := newBigCache(context.Background(), Config{
 		Shards:             4,
-		LifeWindow:         time.Second,
+		LifeWindow:         10 * time.Second,
 		MaxEntriesInWindow: 1,
 		MaxEntrySize:       256,
 	}, &clock)
@@ -1586,4 +1586,225 @@ func TestCloseIdempotent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestGetDoesNotReturnExpiredEntry(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	cache, _ := newBigCache(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         5 * time.Second,
+		CleanWindow:        5 * time.Minute,
+		MaxEntriesInWindow: 1,
+		MaxEntrySize:       256,
+	}, &clock)
+	defer cache.Close()
+	cache.Set("key", []byte("value"))
+
+	// when the entry is still valid
+	value, err := cache.Get("key")
+
+	// then
+	noError(t, err)
+	assertEqual(t, []byte("value"), value)
+
+	// when the entry expires but has not been cleaned up yet
+	clock.set(10)
+	value, err = cache.Get("key")
+
+	// then it must not be returned by Get
+	assertEqual(t, ErrEntryNotFound, err)
+	assertEqual(t, []byte(nil), value)
+
+	// but GetWithInfo still reports it with the Expired status
+	value, resp, err := cache.GetWithInfo("key")
+	noError(t, err)
+	assertEqual(t, RemoveReason(Expired), resp.EntryStatus)
+	assertEqual(t, []byte("value"), value)
+}
+
+func TestCleanUpRemovesOnlyEntriesExpiredAtRoundStart(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	cache, _ := newBigCache(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         5 * time.Second,
+		MaxEntriesInWindow: 10,
+		MaxEntrySize:       256,
+	}, &clock)
+	defer cache.Close()
+
+	cache.Set("old", []byte("old"))
+	clock.set(4)
+	cache.Set("new", []byte("new"))
+
+	// when a clean-up round runs for t=5, only "old" (ts=0) is expired
+	cache.cleanUp(5)
+
+	// then
+	_, err := cache.Get("old")
+	assertEqual(t, ErrEntryNotFound, err)
+	_, err = cache.Get("new")
+	noError(t, err)
+
+	// when the round timestamp does not advance, "new" (expires at t=9) must survive
+	cache.cleanUp(5)
+
+	// then
+	_, err = cache.Get("new")
+	noError(t, err)
+
+	// when its own life window elapses
+	cache.cleanUp(9)
+
+	// then
+	_, err = cache.Get("new")
+	assertEqual(t, ErrEntryNotFound, err)
+}
+
+func TestOnRemoveCalledExactlyOncePerEntry(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	reasons := make(map[string]RemoveReason)
+	onRemove := func(key string, entry []byte, reason RemoveReason) {
+		mu.Lock()
+		calls[key]++
+		reasons[key] = reason
+		mu.Unlock()
+	}
+	cache, _ := newBigCache(context.Background(), Config{
+		Shards:             8,
+		LifeWindow:         time.Second,
+		CleanWindow:        time.Hour, // cleaner goroutine never fires during the test
+		MaxEntriesInWindow: 100,
+		MaxEntrySize:       256,
+		OnRemoveWithReason: onRemove,
+	}, &clock)
+	defer cache.Close()
+
+	keysCount := 100
+	for i := 0; i < keysCount; i++ {
+		cache.Set(fmt.Sprintf("key%d", i), []byte("value"))
+	}
+	clock.set(10)
+
+	// when deletes race with a clean-up round over the same expired entries
+	var wg sync.WaitGroup
+	for i := 0; i < keysCount; i += 2 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			cache.Delete(fmt.Sprintf("key%d", i))
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cache.cleanUp(uint64(clock.Epoch()))
+	}()
+	wg.Wait()
+
+	// then every entry was reported exactly once, with a consistent reason
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 0; i < keysCount; i++ {
+		key := fmt.Sprintf("key%d", i)
+		assertEqual(t, 1, calls[key])
+		if i%2 == 0 && reasons[key] != Deleted && reasons[key] != Expired {
+			t.Errorf("unexpected reason %d for key %q", reasons[key], key)
+		}
+		if i%2 == 1 && reasons[key] != Expired {
+			t.Errorf("unexpected reason %d for key %q", reasons[key], key)
+		}
+	}
+}
+
+func TestCleanUpAfterCloseIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	var mu sync.Mutex
+	removed := 0
+	onRemove := func(key string, entry []byte, reason RemoveReason) {
+		mu.Lock()
+		removed++
+		mu.Unlock()
+	}
+	cache, _ := newBigCache(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Second,
+		CleanWindow:        time.Hour,
+		MaxEntriesInWindow: 10,
+		MaxEntrySize:       256,
+		OnRemoveWithReason: onRemove,
+	}, &clock)
+
+	cache.Set("key", []byte("value"))
+	clock.set(10)
+	err := cache.Close()
+	noError(t, err)
+
+	// when a late clean-up runs after Close
+	cache.cleanUp(uint64(clock.Epoch()))
+
+	// then it must not remove entries or fire callbacks
+	mu.Lock()
+	assertEqual(t, 0, removed)
+	mu.Unlock()
+	assertEqual(t, 1, cache.Len())
+}
+
+func TestCloseStopsLateCleanUpCallbacks(t *testing.T) {
+	// given
+	var mu sync.Mutex
+	removed := 0
+	onRemove := func(key string, entry []byte, reason RemoveReason) {
+		mu.Lock()
+		removed++
+		mu.Unlock()
+	}
+	cache, err := New(context.Background(), Config{
+		Shards:             1,
+		LifeWindow:         time.Second,
+		CleanWindow:        10 * time.Millisecond,
+		MaxEntriesInWindow: 10,
+		MaxEntrySize:       256,
+		OnRemoveWithReason: onRemove,
+	})
+	noError(t, err)
+	cache.Set("key", []byte("value"))
+
+	// wait for the cleaner to evict the expired entry
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		done := removed > 0
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	assertEqual(t, 1, removed)
+	mu.Unlock()
+
+	// when
+	err = cache.Close()
+	noError(t, err)
+
+	// then no late clean-up fires callbacks after Close returned
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	assertEqual(t, 1, removed)
+	mu.Unlock()
 }

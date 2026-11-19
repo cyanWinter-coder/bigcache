@@ -54,7 +54,7 @@ type EntryInfoIterator struct {
 	currentShard     int
 	currentIndex     int
 	currentEntryInfo EntryInfo
-	elements         []uint64
+	elements         [][]byte
 	elementsCount    int
 	valid            bool
 }
@@ -68,31 +68,21 @@ func (it *EntryInfoIterator) SetNext() bool {
 
 	if it.elementsCount > it.currentIndex {
 		it.valid = true
-
-		empty := it.setCurrentEntry()
+		it.setCurrentEntry()
 		it.mutex.Unlock()
-
-		if empty {
-			return it.SetNext()
-		}
 		return true
 	}
 
 	for i := it.currentShard + 1; i < it.cache.config.Shards; i++ {
-		it.elements, it.elementsCount = it.cache.shards[i].copyHashedKeys()
+		it.elements, it.elementsCount = it.cache.shards[i].copyEntries()
 
 		// Non empty shard - stick with it
 		if it.elementsCount > 0 {
 			it.currentIndex = 0
 			it.currentShard = i
 			it.valid = true
-
-			empty := it.setCurrentEntry()
+			it.setCurrentEntry()
 			it.mutex.Unlock()
-
-			if empty {
-				return it.SetNext()
-			}
 			return true
 		}
 	}
@@ -100,32 +90,21 @@ func (it *EntryInfoIterator) SetNext() bool {
 	return false
 }
 
-func (it *EntryInfoIterator) setCurrentEntry() bool {
-	var entryNotFound = false
-	entry, err := it.cache.shards[it.currentShard].getEntry(it.elements[it.currentIndex])
-
-	if err == ErrEntryNotFound {
-		it.currentEntryInfo = emptyEntryInfo
-		entryNotFound = true
-	} else if err != nil {
-		it.currentEntryInfo = EntryInfo{
-			err: err,
-		}
-	} else {
-		it.currentEntryInfo = EntryInfo{
-			timestamp: readTimestampFromEntry(entry),
-			hash:      readHashFromEntry(entry),
-			key:       readKeyFromEntry(entry),
-			value:     readEntry(entry),
-			err:       err,
-		}
+// setCurrentEntry parses the wrapped entry at the current position of the
+// shard snapshot. Snapshot entries are private copies taken under the shard
+// lock, so they cannot be affected by concurrent clean-up or eviction.
+func (it *EntryInfoIterator) setCurrentEntry() {
+	entry := it.elements[it.currentIndex]
+	it.currentEntryInfo = EntryInfo{
+		timestamp: readTimestampFromEntry(entry),
+		hash:      readHashFromEntry(entry),
+		key:       readKeyFromEntry(entry),
+		value:     readEntry(entry),
 	}
-
-	return entryNotFound
 }
 
 func newIterator(cache *BigCache) *EntryInfoIterator {
-	elements, count := cache.shards[0].copyHashedKeys()
+	elements, count := cache.shards[0].copyEntries()
 
 	return &EntryInfoIterator{
 		cache:         cache,
